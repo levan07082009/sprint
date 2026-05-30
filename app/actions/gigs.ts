@@ -1,33 +1,42 @@
 "use server";
 
-import { prisma } from "@/lib/prisma";
+import { createServerClient, getProfile } from "@/lib/supabase-server";
 import { auth } from "@clerk/nextjs/server";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 
 export async function getRecommendedGigs() {
   const { userId } = await auth();
-  if (!userId) throw new Error("Unauthorized");
+  if (!userId) {
+    console.log("No user ID");
+    return [];
+  }
 
-  // For students, fetch active gigs
   try {
-    const gigs = await prisma.gig.findMany({
-      where: {
-        status: "ACTIVE",
-      },
-      include: {
-        employer: {
-          include: {
-            profile: true
-          }
-        }
-      },
-      orderBy: {
-        createdAt: "desc"
-      },
-      take: 20
-    });
-    return gigs;
+    const supabase = createServerClient();
+
+    const { data, error } = await supabase
+      .from('gigs')
+      .select(`
+        *,
+        employer:profiles!gigs_employer_id_fkey(
+          id,
+          display_name,
+          avatar_url,
+          trust_score,
+          role
+        )
+      `)
+      .eq('status', 'ACTIVE')
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      console.error("Failed to fetch recommended gigs:", error);
+      return [];
+    }
+
+    return data || [];
   } catch (error) {
     console.error("Failed to fetch recommended gigs:", error);
     return [];
@@ -39,27 +48,26 @@ export async function getMyPostedGigs() {
   if (!userId) throw new Error("Unauthorized");
 
   try {
-    // Find the Prisma User ID linked to the Clerk ID
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId }
-    });
+    const profile = await getProfile(userId);
+    if (!profile) return [];
 
-    if (!user) throw new Error("User not found");
+    const supabase = createServerClient();
 
-    const gigs = await prisma.gig.findMany({
-      where: {
-        employerId: user.id
-      },
-      include: {
-        _count: {
-          select: { applications: true }
-        }
-      },
-      orderBy: {
-        createdAt: "desc"
-      }
-    });
-    return gigs;
+    const { data, error } = await supabase
+      .from('gigs')
+      .select(`
+        *,
+        applications(count)
+      `)
+      .eq('employer_id', profile.id)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error("Failed to fetch my posted gigs:", error);
+      return [];
+    }
+
+    return data || [];
   } catch (error) {
     console.error("Failed to fetch my posted gigs:", error);
     return [];
@@ -70,8 +78,9 @@ const createGigSchema = z.object({
   title: z.string().min(5, "Title must be at least 5 characters"),
   description: z.string().min(10, "Description must be at least 10 characters"),
   budget: z.coerce.number().positive("Budget must be positive"),
-  requiredSkills: z.string(), // We'll just take one category for now
+  category: z.string().optional(),
   urgency: z.enum(["STANDARD", "ASAP"]),
+  location: z.string().optional(),
 });
 
 export async function createGig(prevState: any, formData: FormData) {
@@ -79,12 +88,9 @@ export async function createGig(prevState: any, formData: FormData) {
     const { userId } = await auth();
     if (!userId) return { error: "Unauthorized" };
 
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true, role: true }
-    });
+    const profile = await getProfile(userId);
 
-    if (!user || user.role === "STUDENT") {
+    if (!profile || profile.role === "STUDENT") {
       return { error: "Only employers can post gigs" };
     }
 
@@ -92,27 +98,35 @@ export async function createGig(prevState: any, formData: FormData) {
       title: formData.get("title"),
       description: formData.get("description"),
       budget: formData.get("budget"),
-      requiredSkills: formData.get("category"),
+      category: formData.get("category"),
       urgency: formData.get("urgency") || "STANDARD",
+      location: formData.get("location"),
     };
 
     const validatedData = createGigSchema.parse(rawData);
+    const supabase = createServerClient();
 
-    await prisma.gig.create({
-      data: {
-        employerId: user.id,
+    const { error } = await supabase
+      .from('gigs')
+      .insert({
+        employer_id: profile.id,
         title: validatedData.title,
         description: validatedData.description,
         budget: validatedData.budget,
-        requiredSkills: [validatedData.requiredSkills],
+        required_skills: validatedData.category ? [validatedData.category] : [],
         urgency: validatedData.urgency,
-        status: "ACTIVE", // Set immediately to ACTIVE
-      }
-    });
+        location: validatedData.location,
+        status: 'ACTIVE',
+      });
+
+    if (error) {
+      console.error("Gig creation error:", error);
+      return { error: "Failed to create gig" };
+    }
 
     revalidatePath("/business");
     revalidatePath("/individual");
-    revalidatePath("/student"); // Revalidate student feed too
+    revalidatePath("/student");
     return { success: true };
   } catch (error) {
     if (error instanceof z.ZodError) {
@@ -122,63 +136,59 @@ export async function createGig(prevState: any, formData: FormData) {
   }
 }
 
-const applyGigSchema = z.object({
-  gigId: z.string(),
-  coverNote: z.string().min(10, "Cover note must be at least 10 characters"),
-  proposedRate: z.coerce.number().positive("Rate must be positive").optional(),
-});
-
 export async function applyToGig(prevState: any, formData: FormData) {
   try {
     const { userId } = await auth();
     if (!userId) return { error: "Unauthorized" };
 
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true, role: true }
-    });
+    const profile = await getProfile(userId);
 
-    if (!user || user.role !== "STUDENT") {
+    if (!profile || profile.role !== "STUDENT") {
       return { error: "Only students can apply to gigs" };
     }
 
-    const rawData = {
-      gigId: formData.get("gigId"),
-      coverNote: formData.get("coverNote"),
-      proposedRate: formData.get("proposedRate") || undefined,
-    };
+    const gigId = formData.get("gigId") as string;
+    const coverNote = formData.get("coverNote") as string;
+    const proposedRate = formData.get("proposedRate");
 
-    const validatedData = applyGigSchema.parse(rawData);
+    if (!gigId || !coverNote || coverNote.length < 10) {
+      return { error: "Invalid input data" };
+    }
 
-    // Ensure they haven't already applied
-    const existingApplication = await prisma.application.findFirst({
-      where: {
-        gigId: validatedData.gigId,
-        applicantId: user.id,
-      }
-    });
+    const supabase = createServerClient();
 
-    if (existingApplication) {
+    // Check if already applied
+    const { data: existing } = await supabase
+      .from('applications')
+      .select('id')
+      .eq('gig_id', gigId)
+      .eq('applicant_id', profile.id)
+      .maybeSingle();
+
+    if (existing) {
       return { error: "You have already applied to this gig" };
     }
 
-    await prisma.application.create({
-      data: {
-        gigId: validatedData.gigId,
-        applicantId: user.id,
-        coverNote: validatedData.coverNote,
-        proposedRate: validatedData.proposedRate,
-        status: "PENDING",
-      }
-    });
+    const { error } = await supabase
+      .from('applications')
+      .insert({
+        gig_id: gigId,
+        applicant_id: profile.id,
+        cover_note: coverNote,
+        proposed_rate: proposedRate ? parseFloat(proposedRate as string) : null,
+        status: 'PENDING',
+      });
+
+    if (error) {
+      console.error("Application creation error:", error);
+      return { error: "Failed to submit application" };
+    }
 
     revalidatePath("/student");
     revalidatePath("/student/applications");
     return { success: true };
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      return { error: error.issues[0].message };
-    }
+    console.error("Apply to gig error:", error);
     return { error: "Failed to submit application" };
   }
 }
@@ -188,21 +198,22 @@ export async function completeGigAndPay(gigId: string, amount: number) {
     const { userId } = await auth();
     if (!userId) return { error: "Unauthorized" };
 
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true, role: true }
-    });
+    const profile = await getProfile(userId);
 
-    if (!user || (user.role !== "BUSINESS" && user.role !== "INDIVIDUAL")) {
+    if (!profile || (profile.role !== "BUSINESS" && profile.role !== "INDIVIDUAL")) {
       return { error: "Only employers can complete gigs" };
     }
 
-    // Verify gig ownership and status
-    const gig = await prisma.gig.findUnique({
-      where: { id: gigId }
-    });
+    const supabase = createServerClient();
 
-    if (!gig || gig.employerId !== user.id) {
+    // Verify gig ownership
+    const { data: gig } = await supabase
+      .from('gigs')
+      .select('id, employer_id, status')
+      .eq('id', gigId)
+      .single();
+
+    if (!gig || gig.employer_id !== profile.id) {
       return { error: "Gig not found or unauthorized" };
     }
 
@@ -210,21 +221,45 @@ export async function completeGigAndPay(gigId: string, amount: number) {
       return { error: "Gig is already completed" };
     }
 
-    // Update Gig status to COMPLETED and create a Transaction record in one transaction
-    await prisma.$transaction([
-      prisma.gig.update({
-        where: { id: gigId },
-        data: { status: "COMPLETED" }
-      }),
-      prisma.transaction.create({
-        data: {
-          gigId: gigId,
-          amount: amount,
-          status: "RELEASED",
-          paymentMethod: "QR_CODE",
-        }
-      })
-    ]);
+    // Get accepted application
+    const { data: application } = await supabase
+      .from('applications')
+      .select('applicant_id')
+      .eq('gig_id', gigId)
+      .eq('status', 'ACCEPTED')
+      .single();
+
+    if (!application) {
+      return { error: "No accepted application found" };
+    }
+
+    // Create transaction
+    const { error: txError } = await supabase
+      .from('transactions')
+      .insert({
+        gig_id: gigId,
+        payer_id: profile.id,
+        payee_id: application.applicant_id,
+        amount: amount,
+        status: 'RELEASED',
+        payment_method: 'QR_CODE',
+      });
+
+    if (txError) {
+      console.error("Transaction creation error:", txError);
+      return { error: "Failed to create transaction" };
+    }
+
+    // Update gig status
+    const { error: gigError } = await supabase
+      .from('gigs')
+      .update({ status: 'COMPLETED', updated_at: new Date().toISOString() })
+      .eq('id', gigId);
+
+    if (gigError) {
+      console.error("Gig update error:", gigError);
+      return { error: "Failed to update gig status" };
+    }
 
     revalidatePath("/business");
     revalidatePath("/individual");
